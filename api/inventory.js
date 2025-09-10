@@ -2,6 +2,7 @@
 // Fetches product + variant inventory from Shopify Admin REST API
 // and returns a compact array suitable for Squarespace embedding.
 
+const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || "https://shop.rockcrestgardens.com";
 const DEFAULT_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. "rockcrest.myshopify.com"
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token
