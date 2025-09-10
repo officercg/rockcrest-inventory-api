@@ -1,33 +1,50 @@
-// Serverless function for Vercel (Node 20)
-// Fetches product + variant inventory from Shopify Admin REST API
-// and returns a compact array suitable for Squarespace embedding.
+// api/inventory.js
+// Rock Crest Inventory API — Vercel Serverless (Node 20)
 
-const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || "https://shop.rockcrestgardens.com";
-const DEFAULT_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
-const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. "rockcrest.myshopify.com"
-const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;   // Admin API access token
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"; // Set to your Squarespace domain for stricter CORS
+// ===== Env =====
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07";          // e.g. "2025-07"
+const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;                      // e.g. "cf3a53.myshopify.com"
+const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;                       // Admin API access token
+const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || "https://shop.rockcrestgardens.com"; // public storefront
+// ALLOWED_ORIGIN can be "*" or a comma-separated list of origins (https://host)
+// e.g. "https://www.rockcrestgardens.com,https://rockcrestgardens.com,https://rockcrestgardens.squarespace.com"
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ===== Utils =====
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Parse Link header for REST cursor pagination
 function parseLinkHeader(linkHeader) {
   if (!linkHeader) return {};
-  const parts = linkHeader.split(",");
   const links = {};
-  for (const part of parts) {
-    const section = part.split(";");
-    if (section.length < 2) continue;
-    const url = section[0].trim().replace(/^<|>$/g, "");
-    const rel = section[1].trim().replace(/rel="(.+?)"/, "$1");
-    links[rel] = url;
+  for (const part of linkHeader.split(",")) {
+    const [rawUrl, rawRel] = part.split(";");
+    if (!rawUrl || !rawRel) continue;
+    const url = rawUrl.trim().replace(/^<|>$/g, "");
+    const rel = (rawRel.match(/rel="(.+?)"/) || [])[1];
+    if (rel) links[rel] = url;
   }
   return links;
 }
 
-// Fetch all products with pagination (REST)
+function setCors(req, res) {
+  const origin = req.headers.origin;
+
+  // Reflect any origin when "*" (useful for testing)
+  if (ALLOWED_ORIGINS.length === 1 && ALLOWED_ORIGINS[0] === "*") {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 async function fetchAllProducts({ fields = "id,title,handle,images,variants,product_type,tags", limit = 250 }) {
-  let url = `https://${STORE_DOMAIN}/admin/api/${DEFAULT_API_VERSION}/products.json?limit=${limit}&fields=${encodeURIComponent(fields)}`;
+  let url = `https://${STORE_DOMAIN}/admin/api/${API_VERSION}/products.json?limit=${limit}&fields=${encodeURIComponent(fields)}`;
   const items = [];
 
   while (url) {
@@ -38,15 +55,16 @@ async function fetchAllProducts({ fields = "id,title,handle,images,variants,prod
       }
     });
 
+    // Rate-limited — back off and retry loop iteration without advancing page
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get("Retry-After") || "2");
-      await sleep(retryAfter * 1000);
+      await sleep(Math.min(retryAfter, 5) * 1000);
       continue;
     }
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`Shopify error ${res.status}: ${text || res.statusText}`);
+      throw new Error(`Shopify ${res.status} ${res.statusText}: ${text || "request failed"}`);
     }
 
     const data = await res.json();
@@ -55,15 +73,13 @@ async function fetchAllProducts({ fields = "id,title,handle,images,variants,prod
     const links = parseLinkHeader(res.headers.get("link"));
     url = links.next || null;
   }
-
   return items;
 }
 
-// Map products/variants to a simple shape
 function mapProductsToInventory(products) {
   const rows = [];
   for (const p of products) {
-    const img = (p.images && p.images[0] && p.images[0].src) ? p.images[0].src : null;
+    const img = p.images?.[0]?.src || null;
     for (const v of (p.variants || [])) {
       rows.push({
         productId: String(p.id),
@@ -77,26 +93,19 @@ function mapProductsToInventory(products) {
         image: img,
         productType: p.product_type || null,
         tags: p.tags || null,
-        url: p.handle ? `https://${STORE_DOMAIN}/products/${p.handle}` : null
+        url: p.handle ? `${PUBLIC_STORE_DOMAIN}/products/${p.handle}` : null
       });
     }
   }
   return rows;
 }
 
-function filterInStock(items) {
-  return items.filter(i => typeof i.quantity === "number" && i.quantity > 0);
-}
+const filterInStock = (items) => items.filter(i => typeof i.quantity === "number" && i.quantity > 0);
 
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
+// ===== Handler =====
 export default async function handler(req, res) {
-  setCors(res);
-  if (req.method === "OPTIONS") return res.status(200).end();
+  setCors(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
 
   try {
     if (!STORE_DOMAIN || !ADMIN_TOKEN) {
@@ -110,18 +119,24 @@ export default async function handler(req, res) {
     const showOutOfStock = (req.query.showOutOfStock || "").toLowerCase() === "true";
     const productType = req.query.productType || null;
     const hasTag = req.query.tag || null;
+    const minimal = (req.query.minimal || "").toLowerCase() === "true";
 
+    // Cache at the edge for 30s, allow 2 min stale while revalidating
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
 
     const products = await fetchAllProducts({});
     let items = mapProductsToInventory(products);
 
-    if (productType) items = items.filter(i => (i.productType || "").toLowerCase() === productType.toLowerCase());
-    if (hasTag) items = items.filter(i => (i.tags || "").toLowerCase().split(", ").includes(hasTag.toLowerCase()));
-
+    if (productType) {
+      const needle = productType.toLowerCase();
+      items = items.filter(i => (i.productType || "").toLowerCase() === needle);
+    }
+    if (hasTag) {
+      const t = hasTag.toLowerCase();
+      items = items.filter(i => (i.tags || "").toLowerCase().split(", ").includes(t));
+    }
     if (!showOutOfStock) items = filterInStock(items);
 
-    const minimal = (req.query.minimal || "").toLowerCase() === "true";
     if (minimal) {
       items = items.map(i => ({
         title: i.title,
@@ -129,7 +144,8 @@ export default async function handler(req, res) {
         sku: i.sku,
         qty: i.quantity,
         price: i.price,
-        image: i.image
+        image: i.image,
+        url: i.url
       }));
     }
 
