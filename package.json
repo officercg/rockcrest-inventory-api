@@ -2,11 +2,6 @@
   "name": "rockcrest-inventory-api",
   "private": true,
   "type": "module",
-  "scripts": {
-    "dev": "vercel dev",
-    "start": "node api/inventory.js"
-  },
-  "engines": {
-    "node": ">=20"
-  }
+  "scripts": {},
+  "engines": { "node": ">=20" }
 }
