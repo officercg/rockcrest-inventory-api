@@ -149,8 +149,9 @@ export default async function handler(req, res) {
       }));
     }
 
-    res.status(200).json({ ok: true, count: items.length, items });
-  } catch (err) {
+    const generatedAt = new Date().toISOString();
+res.setHeader("X-RC-Generated-At", generatedAt); // optional handy header
+res.status(200).json({ ok: true, generatedAt, count: items.length, items });
     console.error(err);
     res.status(500).json({ ok: false, error: err.message || "Internal error" });
   }
