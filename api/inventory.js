@@ -2,12 +2,14 @@
 // Rock Crest Inventory API — Vercel Serverless (Node 20)
 
 // ===== Env =====
-const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07";          // e.g. "2025-07"
-const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;                      // e.g. "cf3a53.myshopify.com"
-const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;                       // Admin API access token
-const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || "https://shop.rockcrestgardens.com"; // public storefront
-// ALLOWED_ORIGIN can be "*" or a comma-separated list of origins (https://host)
-// e.g. "https://www.rockcrestgardens.com,https://rockcrestgardens.com,https://rockcrestgardens.squarespace.com"
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07"; // e.g. "2025-07"
+const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;            // e.g. "cf3a53.myshopify.com"
+const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN;             // Shopify Admin API token
+const PUBLIC_STORE_DOMAIN =
+  process.env.PUBLIC_STORE_DOMAIN || "https://shop.rockcrestgardens.com"; // public storefront base URL
+
+// ALLOWED_ORIGIN can be "*" or a comma-separated list of exact origins
+// Example: "https://www.rockcrestgardens.com,https://rockcrestgardens.com,https://rockcrestgardens.squarespace.com"
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*")
   .split(",")
   .map(s => s.trim())
@@ -32,7 +34,7 @@ function parseLinkHeader(linkHeader) {
 function setCors(req, res) {
   const origin = req.headers.origin;
 
-  // Reflect any origin when "*" (useful for testing)
+  // Reflect any origin when "*" (useful during testing)
   if (ALLOWED_ORIGINS.length === 1 && ALLOWED_ORIGINS[0] === "*") {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
   } else if (origin && ALLOWED_ORIGINS.includes(origin)) {
@@ -43,7 +45,11 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-async function fetchAllProducts({ fields = "id,title,handle,images,variants,product_type,tags", limit = 250 }) {
+// Pull all products (paged) from Admin REST
+async function fetchAllProducts({
+  fields = "id,title,handle,images,variants,product_type,tags",
+  limit = 250
+} = {}) {
   let url = `https://${STORE_DOMAIN}/admin/api/${API_VERSION}/products.json?limit=${limit}&fields=${encodeURIComponent(fields)}`;
   const items = [];
 
@@ -55,7 +61,7 @@ async function fetchAllProducts({ fields = "id,title,handle,images,variants,prod
       }
     });
 
-    // Rate-limited — back off and retry loop iteration without advancing page
+    // Rate limited → back off and retry same page
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get("Retry-After") || "2");
       await sleep(Math.min(retryAfter, 5) * 1000);
@@ -76,10 +82,17 @@ async function fetchAllProducts({ fields = "id,title,handle,images,variants,prod
   return items;
 }
 
+// Normalize Shopify products/variants → flat rows
 function mapProductsToInventory(products) {
   const rows = [];
   for (const p of products) {
     const img = p.images?.[0]?.src || null;
+    // Shopify returns tags as comma-separated string; normalize to array
+    const tagArray = (p.tags || "")
+      .split(",")
+      .map(t => t.trim())
+      .filter(Boolean);
+
     for (const v of (p.variants || [])) {
       rows.push({
         productId: String(p.id),
@@ -92,7 +105,7 @@ function mapProductsToInventory(products) {
         quantity: typeof v.inventory_quantity === "number" ? v.inventory_quantity : null,
         image: img,
         productType: p.product_type || null,
-        tags: p.tags || null,
+        tags: tagArray, // <- array form
         url: p.handle ? `${PUBLIC_STORE_DOMAIN}/products/${p.handle}` : null
       });
     }
@@ -118,10 +131,10 @@ export default async function handler(req, res) {
     // Query params
     const showOutOfStock = (req.query.showOutOfStock || "").toLowerCase() === "true";
     const productType = req.query.productType || null;
-    const hasTag = req.query.tag || null;
+    const singleTag = req.query.tag || null; // exact tag match (case-insensitive)
     const minimal = (req.query.minimal || "").toLowerCase() === "true";
 
-    // Cache at the edge for 30s, allow 2 min stale while revalidating
+    // Cache at the edge for 30s; allow 2m stale while revalidating
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
 
     const products = await fetchAllProducts({});
@@ -131,28 +144,37 @@ export default async function handler(req, res) {
       const needle = productType.toLowerCase();
       items = items.filter(i => (i.productType || "").toLowerCase() === needle);
     }
-    if (hasTag) {
-      const t = hasTag.toLowerCase();
-      items = items.filter(i => (i.tags || "").toLowerCase().split(", ").includes(t));
+
+    if (singleTag) {
+      const t = singleTag.toLowerCase();
+      items = items.filter(i => (i.tags || []).some(tag => tag.toLowerCase() === t));
     }
+
     if (!showOutOfStock) items = filterInStock(items);
 
+    // Prepare response
+    const generatedAt = new Date().toISOString();
+    res.setHeader("X-RC-Generated-At", generatedAt);
+
     if (minimal) {
-      items = items.map(i => ({
+      // Return compact shape for embedding
+      const compact = items.map(i => ({
         title: i.title,
         variant: i.variantTitle,
         sku: i.sku,
         qty: i.quantity,
         price: i.price,
         image: i.image,
-        url: i.url
+        url: i.url,
+        tags: i.tags // array
       }));
+      return res.status(200).json({ ok: true, generatedAt, count: compact.length, items: compact });
     }
 
-    const generatedAt = new Date().toISOString();
-res.setHeader("X-RC-Generated-At", generatedAt); // optional handy header
-res.status(200).json({ ok: true, generatedAt, count: items.length, items });
+    // Full shape
+    return res.status(200).json({ ok: true, generatedAt, count: items.length, items });
+  } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: err.message || "Internal error" });
+    return res.status(500).json({ ok: false, error: err.message || "Internal error" });
   }
 }
