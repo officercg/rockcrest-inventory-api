@@ -1,7 +1,7 @@
 // api/inventory.js
-// Rock Crest Inventory API — GraphQL Admin with dimension normalization.
-// Returns rows: title, commonName, plantCaliper, sku, price, qty, url
-// Excludes any product with a tag containing "blue" (case-insensitive)
+// GraphQL Admin — returns rows: title, commonName, plantCaliper, sku, price, qty, url
+// Default: NO tag exclusion (so list always loads).
+// Optional: ?exclude=blue,clearance   (case-insensitive substring match on tags)
 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07";
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;            // e.g. "cf3a53.myshopify.com"
@@ -18,9 +18,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*")
 const META_NAMESPACE   = process.env.META_NAMESPACE  || "custom";
 const KEY_COMMON_NAME  = process.env.KEY_COMMON_NAME || "common_name";
 const KEY_CALIPER      = process.env.KEY_CALIPER     || "plant_caliper";
-
-// Server-side exclusion
-const EXCLUDE_TAG_SUBSTR = "blue";
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -64,9 +61,11 @@ async function gqlFetch(query, variables) {
 }
 
 /**
- * GraphQL returns metafield.value as a string. For "dimension" types,
- * that string is JSON like: {"value":4.0,"unit":"INCHES"}.
- * We also request metafield.type so we can detect & parse reliably.
+ * We fetch:
+ * - product fields
+ * - product metafield common_name
+ * - product + variant metafield plant_caliper (variant wins)
+ * - first 100 variants per product
  */
 const PRODUCTS_QUERY = `
   query Products($first: Int!, $after: String, $ns: String!, $keyCommon: String!, $keyCaliper: String!) {
@@ -97,13 +96,7 @@ const PRODUCTS_QUERY = `
   }
 `;
 
-function hasExcludedTag(tags) {
-  if (!Array.isArray(tags)) return false;
-  const ex = EXCLUDE_TAG_SUBSTR.toLowerCase();
-  return tags.some(t => (t || "").toLowerCase().includes(ex));
-}
-
-// Map Shopify unit enums to concise labels
+// Map Shopify unit enums to concise labels for dimension JSON
 const UNIT_MAP = {
   MILLIMETERS: "mm",
   CENTIMETERS: "cm",
@@ -113,23 +106,11 @@ const UNIT_MAP = {
   YARDS: "yd"
 };
 
-// Accepts:
-// - { value:"{\"value\":4.0,\"unit\":\"INCHES\"}", type:"dimension" }
-// - { value:"4.0", type:"dimension" }  (edge case)
-// - { value:"4", type:"single_line_text_field" } (graceful fallback)
-// Returns "4 in", "10 cm", or null.
+// Normalize dimension metafields ("{\"value\":4.0,\"unit\":\"INCHES\"}") => "4 in"
 function normalizeDimension(mf) {
   if (!mf || mf.value == null) return null;
-
-  // If value is already an object (very rare in GraphQL), try to use it
-  if (typeof mf.value === "object" && mf.value.value != null) {
-    const num = mf.value.value;
-    const unit = UNIT_MAP[(mf.value.unit || "").toUpperCase()] || (mf.value.unit || "").toLowerCase();
-    return unit ? `${num} ${unit}` : String(num);
-  }
-
   const raw = String(mf.value).trim();
-  // Dimension types come back as JSON in value string
+
   if ((mf.type || "").toLowerCase().includes("dimension")) {
     try {
       const parsed = JSON.parse(raw);
@@ -138,11 +119,9 @@ function normalizeDimension(mf) {
         return unit ? `${parsed.value} ${unit}` : String(parsed.value);
       }
     } catch {
-      // If it's not JSON, fall through to plain string
+      // if value wasn't JSON, fall through
     }
   }
-
-  // Fallback: just return the string value (e.g. "4", "4 inches")
   return raw || null;
 }
 
@@ -169,10 +148,16 @@ async function fetchAllProducts(ns, keyCommon, keyCaliper) {
   return out;
 }
 
-function mapToRows(products) {
+function shouldExcludeByTags(tags, excludeList) {
+  if (!excludeList.length) return false;
+  const lower = (tags || []).map(t => (t || "").toLowerCase());
+  return excludeList.some(sub => lower.some(t => t.includes(sub)));
+}
+
+function mapToRows(products, excludeList) {
   const rows = [];
   for (const p of products) {
-    if (hasExcludedTag(p.tags)) continue;
+    if (shouldExcludeByTags(p.tags, excludeList)) continue;
 
     const img = p.images?.edges?.[0]?.node?.url || null;
     const commonName = p.common?.value || null;
@@ -208,8 +193,14 @@ export default async function handler(req, res) {
 
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
 
+    // Optional tag exclusions: ?exclude=blue,clearance
+    const exclude = String(req.query.exclude || "")
+      .split(",")
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean);
+
     const products = await fetchAllProducts(META_NAMESPACE, KEY_COMMON_NAME, KEY_CALIPER);
-    const items = mapToRows(products);
+    const items = mapToRows(products, exclude);
 
     const generatedAt = new Date().toISOString();
     res.setHeader("X-RC-Generated-At", generatedAt);
