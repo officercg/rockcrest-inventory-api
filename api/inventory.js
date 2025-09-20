@@ -1,5 +1,7 @@
 // api/inventory.js
-// Rock Crest Inventory API — minimal fast payload with metafields + "Blue" tag exclusion.
+// Rock Crest Inventory API — bulk metafields with smart matching + optional debug
+// Columns returned: title, commonName, plantCaliper, sku, price, qty, url
+// Server-side exclusion: any product with a tag containing "blue" (case-insensitive)
 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07";
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;            // e.g. "cf3a53.myshopify.com"
@@ -12,12 +14,12 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*")
   .map(s => s.trim())
   .filter(Boolean);
 
-// Metafield mapping (defaults match your Shopify Liquid snippet)
+// Metafield mapping (defaults match your Shopify Liquid)
 const META_NAMESPACE   = process.env.META_NAMESPACE   || "custom";
 const KEY_COMMON_NAME  = process.env.KEY_COMMON_NAME  || "common_name";
 const KEY_CALIPER      = process.env.KEY_CALIPER      || "plant_caliper";
 
-// Hardcoded server-side exclusion: any tag containing this substring (case-insensitive)
+// Exclude products whose tags contain this substring (case-insensitive)
 const EXCLUDE_TAG_SUBSTR = "blue";
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -90,41 +92,64 @@ async function fetchAllProductMetafields() {
   return fetchPagedJson(url);
 }
 
+// Build per-product metafield map with smart matching:
+// 1) Prefer exact namespace+key matches (custom.common_name, custom.plant_caliper)
+// 2) If missing, fall back to any namespace where key matches (common_name / plant_caliper)
 function buildMetaMap(allMetafields) {
-  // Only keep the ones we care about; group by product owner_id
-  const wanted = new Set([
-    `${META_NAMESPACE}:${KEY_COMMON_NAME}`.toLowerCase(),
-    `${META_NAMESPACE}:${KEY_CALIPER}`.toLowerCase(),
+  const WANT_KEYS_LO = new Set([
+    KEY_COMMON_NAME.toLowerCase(),
+    KEY_CALIPER.toLowerCase()
   ]);
-  const map = new Map(); // productId -> { commonName, plantCaliper }
 
+  const preferredNs = META_NAMESPACE.toLowerCase();
+
+  // First pass: collect candidates per product id
+  const byProduct = new Map(); // pid -> { candidates: {key:[{ns,key,value}, ...]} }
   for (const mf of allMetafields) {
     if (!mf || mf.owner_resource !== "product") continue;
-    const keySig = `${(mf.namespace || "").toLowerCase()}:${(mf.key || "").toLowerCase()}`;
-    if (!wanted.has(keySig)) continue;
+    const pid = String(mf.owner_id || "");
+    if (!pid) continue;
 
-    const pid = String(mf.owner_id);
-    const cur = map.get(pid) || { commonName: null, plantCaliper: null };
+    const ns = (mf.namespace || "").toLowerCase();
+    const key = (mf.key || "").toLowerCase();
+    if (!WANT_KEYS_LO.has(key)) continue; // ignore other keys
 
-    if (mf.key.toLowerCase() === KEY_COMMON_NAME.toLowerCase()) cur.commonName = mf.value || null;
-    if (mf.key.toLowerCase() === KEY_CALIPER.toLowerCase())     cur.plantCaliper = mf.value || null;
-
-    map.set(pid, cur);
+    const entry = byProduct.get(pid) || { candidates: {} };
+    if (!entry.candidates[key]) entry.candidates[key] = [];
+    entry.candidates[key].push({ ns, key, value: mf.value ?? null });
+    byProduct.set(pid, entry);
   }
-  return map;
+
+  // Second pass: choose best candidate per key (prefer preferredNs)
+  const out = new Map(); // pid -> { commonName, plantCaliper }
+  for (const [pid, { candidates }] of byProduct.entries()) {
+    let commonName = null, plantCaliper = null;
+
+    const choose = (k) => {
+      const list = candidates[k] || [];
+      if (!list.length) return null;
+      const exact = list.find(x => x.ns === preferredNs);
+      return (exact ? exact.value : list[0].value) ?? null;
+    };
+
+    commonName = choose(KEY_COMMON_NAME.toLowerCase());
+    plantCaliper = choose(KEY_CALIPER.toLowerCase());
+
+    out.set(pid, { commonName, plantCaliper });
+  }
+
+  return out;
 }
 
 function productHasExcludedTag(p) {
   if (!p || !p.tags) return false;
   const ex = EXCLUDE_TAG_SUBSTR.toLowerCase();
-  // Shopify product.tags is a comma-separated string
   return p.tags.split(",").some(t => t.trim().toLowerCase().includes(ex));
 }
 
 function mapProductsToRows(products, metaMap) {
   const rows = [];
   for (const p of products) {
-    // Server-side exclusion by tag substring "blue"
     if (productHasExcludedTag(p)) continue;
 
     const img = p.images?.[0]?.src || null;
@@ -139,7 +164,7 @@ function mapProductsToRows(products, metaMap) {
         price: v.price != null ? String(v.price) : null,
         qty: typeof v.inventory_quantity === "number" ? v.inventory_quantity : null,
         url: p.handle ? `${PUBLIC_STORE_DOMAIN}/products/${p.handle}` : null,
-        image: img,
+        image: img
       });
     }
   }
@@ -155,28 +180,41 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, error: "Missing env vars: SHOPIFY_STORE_DOMAIN and/or SHOPIFY_ADMIN_TOKEN" });
     }
 
+    // Debug: /api/inventory?debugMeta=1&limit=1
+    const debugMeta = String(req.query.debugMeta || "").toLowerCase() === "1";
+    const limit = Math.max(0, parseInt(String(req.query.limit || "0"), 10) || 0);
+
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
 
-    // 1) products (paged)
-    const products = await fetchAllProducts();
+    // 1) products
+    let products = await fetchAllProducts();
+    if (limit > 0) products = products.slice(0, limit);
 
-    // 2) metafields (paged, bulk) -> map by product
+    // 2) metafields (bulk)
     const allMetafields = await fetchAllProductMetafields();
+
+    if (debugMeta) {
+      // Show a summary so we can confirm namespace/keys coming back from Shopify
+      const sample = allMetafields.slice(0, 50).map(mf => ({
+        owner_id: mf.owner_id,
+        owner_resource: mf.owner_resource,
+        namespace: mf.namespace,
+        key: mf.key,
+        value_preview: typeof mf.value === "string" ? mf.value.slice(0, 40) : mf.value
+      }));
+      return res.status(200).json({ ok: true, note: "debugMeta sample", count: sample.length, sample });
+    }
+
+    // 3) map metafields -> product
     const metaMap = buildMetaMap(allMetafields);
 
-    // 3) flatten rows (no out-of-stock filter; includes qty 0)
+    // 4) flatten rows (include all inventory; qty may be 0)
     const items = mapProductsToRows(products, metaMap);
 
     const generatedAt = new Date().toISOString();
     res.setHeader("X-RC-Generated-At", generatedAt);
 
-    // Always return the compact/minimal shape your Squarespace expects
-    return res.status(200).json({
-      ok: true,
-      generatedAt,
-      count: items.length,
-      items
-    });
+    return res.status(200).json({ ok: true, generatedAt, count: items.length, items });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: err.message || "Internal error" });
