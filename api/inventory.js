@@ -1,5 +1,5 @@
 // api/inventory.js
-// Rock Crest Inventory API — GraphQL Admin, with product + variant metafields.
+// Rock Crest Inventory API — GraphQL Admin with dimension normalization.
 // Returns rows: title, commonName, plantCaliper, sku, price, qty, url
 // Excludes any product with a tag containing "blue" (case-insensitive)
 
@@ -14,7 +14,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*")
   .map(s => s.trim())
   .filter(Boolean);
 
-// Metafield mapping (defaults match your Shopify Liquid & definitions)
+// Metafield mapping (defaults match your Shopify setup)
 const META_NAMESPACE   = process.env.META_NAMESPACE  || "custom";
 const KEY_COMMON_NAME  = process.env.KEY_COMMON_NAME || "common_name";
 const KEY_CALIPER      = process.env.KEY_CALIPER     || "plant_caliper";
@@ -58,16 +58,16 @@ async function gqlFetch(query, variables) {
     }
 
     const data = await res.json();
-    if (data.errors) {
-      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
-    }
+    if (data.errors) throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
     return data.data;
   }
 }
 
-// NOTE: We read metafield.value (string). For "Dimension" metafields,
-// Shopify Admin GraphQL supplies a string value. If you ever need the unit,
-// we can extend this to read definition/type and format, but value is sufficient.
+/**
+ * GraphQL returns metafield.value as a string. For "dimension" types,
+ * that string is JSON like: {"value":4.0,"unit":"INCHES"}.
+ * We also request metafield.type so we can detect & parse reliably.
+ */
 const PRODUCTS_QUERY = `
   query Products($first: Int!, $after: String, $ns: String!, $keyCommon: String!, $keyCaliper: String!) {
     products(first: $first, after: $after) {
@@ -80,14 +80,14 @@ const PRODUCTS_QUERY = `
           tags
           images(first: 1) { edges { node { url: originalSrc } } }
           common: metafield(namespace: $ns, key: $keyCommon) { value }
-          caliperProduct: metafield(namespace: $ns, key: $keyCaliper) { value }
+          caliperProduct: metafield(namespace: $ns, key: $keyCaliper) { value type }
           variants(first: 100) {
             edges {
               node {
                 sku
                 price
                 inventoryQuantity
-                caliperVariant: metafield(namespace: $ns, key: $keyCaliper) { value }
+                caliperVariant: metafield(namespace: $ns, key: $keyCaliper) { value type }
               }
             }
           }
@@ -103,6 +103,57 @@ function hasExcludedTag(tags) {
   return tags.some(t => (t || "").toLowerCase().includes(ex));
 }
 
+// Map Shopify unit enums to concise labels
+const UNIT_MAP = {
+  MILLIMETERS: "mm",
+  CENTIMETERS: "cm",
+  METERS: "m",
+  INCHES: "in",
+  FEET: "ft",
+  YARDS: "yd"
+};
+
+// Accepts:
+// - { value:"{\"value\":4.0,\"unit\":\"INCHES\"}", type:"dimension" }
+// - { value:"4.0", type:"dimension" }  (edge case)
+// - { value:"4", type:"single_line_text_field" } (graceful fallback)
+// Returns "4 in", "10 cm", or null.
+function normalizeDimension(mf) {
+  if (!mf || mf.value == null) return null;
+
+  // If value is already an object (very rare in GraphQL), try to use it
+  if (typeof mf.value === "object" && mf.value.value != null) {
+    const num = mf.value.value;
+    const unit = UNIT_MAP[(mf.value.unit || "").toUpperCase()] || (mf.value.unit || "").toLowerCase();
+    return unit ? `${num} ${unit}` : String(num);
+  }
+
+  const raw = String(mf.value).trim();
+  // Dimension types come back as JSON in value string
+  if ((mf.type || "").toLowerCase().includes("dimension")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.value != null) {
+        const unit = UNIT_MAP[(parsed.unit || "").toUpperCase()] || (parsed.unit || "").toLowerCase();
+        return unit ? `${parsed.value} ${unit}` : String(parsed.value);
+      }
+    } catch {
+      // If it's not JSON, fall through to plain string
+    }
+  }
+
+  // Fallback: just return the string value (e.g. "4", "4 inches")
+  return raw || null;
+}
+
+function pickCaliper(productMF, variantMF) {
+  const v = normalizeDimension(variantMF);
+  if (v) return v;
+  const p = normalizeDimension(productMF);
+  if (p) return p;
+  return null;
+}
+
 async function fetchAllProducts(ns, keyCommon, keyCaliper) {
   let after = null;
   const first = 100;
@@ -116,15 +167,6 @@ async function fetchAllProducts(ns, keyCommon, keyCaliper) {
     after = edges[edges.length - 1].cursor;
   }
   return out;
-}
-
-function pickCaliper(productLevel, variantLevel) {
-  // Prefer variant value if present; fall back to product value
-  const vVal = variantLevel?.value;
-  if (vVal != null && String(vVal).trim() !== "") return String(vVal);
-  const pVal = productLevel?.value;
-  if (pVal != null && String(pVal).trim() !== "") return String(pVal);
-  return null;
 }
 
 function mapToRows(products) {
