@@ -1,7 +1,7 @@
 // api/inventory.js
-// Rock Crest Inventory API — bulk metafields with smart matching + optional debug
-// Columns returned: title, commonName, plantCaliper, sku, price, qty, url
-// Server-side exclusion: any product with a tag containing "blue" (case-insensitive)
+// Rock Crest Inventory API — GraphQL Admin, fast and exact metafields.
+// Returns: title, commonName, plantCaliper, sku, price, qty, url
+// Excludes any product with a tag containing "blue" (case-insensitive)
 
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-07";
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;            // e.g. "cf3a53.myshopify.com"
@@ -15,13 +15,14 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "*")
   .filter(Boolean);
 
 // Metafield mapping (defaults match your Shopify Liquid)
-const META_NAMESPACE   = process.env.META_NAMESPACE   || "custom";
-const KEY_COMMON_NAME  = process.env.KEY_COMMON_NAME  || "common_name";
-const KEY_CALIPER      = process.env.KEY_CALIPER      || "plant_caliper";
+const META_NAMESPACE   = (process.env.META_NAMESPACE || "custom");
+const KEY_COMMON_NAME  = (process.env.KEY_COMMON_NAME || "common_name");
+const KEY_CALIPER      = (process.env.KEY_CALIPER || "plant_caliper");
 
 // Exclude products whose tags contain this substring (case-insensitive)
 const EXCLUDE_TAG_SUBSTR = "blue";
 
+// ---------- helpers ----------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function setCors(req, res) {
@@ -36,133 +37,117 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function parseLinkHeader(linkHeader) {
-  if (!linkHeader) return {};
-  const links = {};
-  for (const part of linkHeader.split(",")) {
-    const [rawUrl, rawRel] = part.split(";");
-    if (!rawUrl || !rawRel) continue;
-    const url = rawUrl.trim().replace(/^<|>$/g, "");
-    const rel = (rawRel.match(/rel="(.+?)"/) || [])[1];
-    if (rel) links[rel] = url;
-  }
-  return links;
-}
-
-async function fetchPagedJson(url) {
-  const out = [];
-  while (url) {
-    const res = await fetch(url, {
+async function gqlFetch(query, variables) {
+  while (true) {
+    const res = await fetch(`https://${STORE_DOMAIN}/admin/api/${API_VERSION}/graphql.json`, {
+      method: "POST",
       headers: {
-        "X-Shopify-Access-Token": ADMIN_TOKEN,
-        "Accept": "application/json"
-      }
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ADMIN_TOKEN
+      },
+      body: JSON.stringify({ query, variables })
     });
 
-    if (res.status === 429) {
+    if (res.status === 429) { // backoff on rate limit
       const retryAfter = Number(res.headers.get("Retry-After") || "2");
       await sleep(Math.min(retryAfter, 5) * 1000);
       continue;
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`${url} -> ${res.status} ${res.statusText}: ${text || "request failed"}`);
+      throw new Error(`GraphQL ${res.status} ${res.statusText}: ${text || "request failed"}`);
     }
 
     const data = await res.json();
-    if (data.products) out.push(...data.products);
-    else if (data.metafields) out.push(...data.metafields);
-    else out.push(data);
-
-    const links = parseLinkHeader(res.headers.get("link"));
-    url = links.next || null;
+    if (data.errors) {
+      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
+    }
+    return data.data;
   }
-  return out;
 }
 
-async function fetchAllProducts() {
-  const fields = "id,title,handle,images,variants,product_type,tags";
-  const url = `https://${STORE_DOMAIN}/admin/api/${API_VERSION}/products.json?limit=250&fields=${encodeURIComponent(fields)}`;
-  return fetchPagedJson(url);
-}
-
-// Bulk fetch ALL product metafields (owner_resource=product)
-async function fetchAllProductMetafields() {
-  const url = `https://${STORE_DOMAIN}/admin/api/${API_VERSION}/metafields.json?limit=250&metafield[owner_resource]=product`;
-  return fetchPagedJson(url);
-}
-
-// Build per-product metafield map with smart matching:
-// 1) Prefer exact namespace+key matches (custom.common_name, custom.plant_caliper)
-// 2) If missing, fall back to any namespace where key matches (common_name / plant_caliper)
-function buildMetaMap(allMetafields) {
-  const WANT_KEYS_LO = new Set([
-    KEY_COMMON_NAME.toLowerCase(),
-    KEY_CALIPER.toLowerCase()
-  ]);
-
-  const preferredNs = META_NAMESPACE.toLowerCase();
-
-  // First pass: collect candidates per product id
-  const byProduct = new Map(); // pid -> { candidates: {key:[{ns,key,value}, ...]} }
-  for (const mf of allMetafields) {
-    if (!mf || mf.owner_resource !== "product") continue;
-    const pid = String(mf.owner_id || "");
-    if (!pid) continue;
-
-    const ns = (mf.namespace || "").toLowerCase();
-    const key = (mf.key || "").toLowerCase();
-    if (!WANT_KEYS_LO.has(key)) continue; // ignore other keys
-
-    const entry = byProduct.get(pid) || { candidates: {} };
-    if (!entry.candidates[key]) entry.candidates[key] = [];
-    entry.candidates[key].push({ ns, key, value: mf.value ?? null });
-    byProduct.set(pid, entry);
+const PRODUCTS_QUERY = `
+  query Products($first: Int!, $after: String, $ns: String!, $keyCommon: String!, $keyCaliper: String!) {
+    products(first: $first, after: $after) {
+      pageInfo { hasNextPage }
+      edges {
+        cursor
+        node {
+          id
+          title
+          handle
+          tags
+          images(first: 1) { edges { node { url: originalSrc } } }
+          variants(first: 100) {
+            edges {
+              node {
+                id
+                sku
+                price
+                inventoryQuantity
+              }
+            }
+          }
+          common: metafield(namespace: $ns, key: $keyCommon) { value }
+          caliper: metafield(namespace: $ns, key: $keyCaliper) { value }
+        }
+      }
+    }
   }
+`;
 
-  // Second pass: choose best candidate per key (prefer preferredNs)
-  const out = new Map(); // pid -> { commonName, plantCaliper }
-  for (const [pid, { candidates }] of byProduct.entries()) {
-    let commonName = null, plantCaliper = null;
-
-    const choose = (k) => {
-      const list = candidates[k] || [];
-      if (!list.length) return null;
-      const exact = list.find(x => x.ns === preferredNs);
-      return (exact ? exact.value : list[0].value) ?? null;
-    };
-
-    commonName = choose(KEY_COMMON_NAME.toLowerCase());
-    plantCaliper = choose(KEY_CALIPER.toLowerCase());
-
-    out.set(pid, { commonName, plantCaliper });
-  }
-
-  return out;
-}
-
-function productHasExcludedTag(p) {
-  if (!p || !p.tags) return false;
+function hasExcludedTag(tags) {
+  if (!tags || !tags.length) return false;
   const ex = EXCLUDE_TAG_SUBSTR.toLowerCase();
-  return p.tags.split(",").some(t => t.trim().toLowerCase().includes(ex));
+  return tags.some(t => (t || "").toLowerCase().includes(ex));
 }
 
-function mapProductsToRows(products, metaMap) {
+async function fetchAllProductPages() {
+  let after = null;
+  const first = 100;
+  const out = [];
+
+  while (true) {
+    const data = await gqlFetch(PRODUCTS_QUERY, {
+      first,
+      after,
+      ns: META_NAMESPACE,
+      keyCommon: KEY_COMMON_NAME,
+      keyCaliper: KEY_CALIPER
+    });
+
+    const edges = data?.products?.edges || [];
+    for (const edge of edges) {
+      out.push(edge.node);
+    }
+
+    const hasNext = data?.products?.pageInfo?.hasNextPage;
+    if (!hasNext || edges.length === 0) break;
+    after = edges[edges.length - 1].cursor;
+  }
+
+  return out;
+}
+
+function mapToRows(products) {
   const rows = [];
   for (const p of products) {
-    if (productHasExcludedTag(p)) continue;
+    if (hasExcludedTag(p.tags)) continue;
 
-    const img = p.images?.[0]?.src || null;
-    const meta = metaMap.get(String(p.id)) || {};
+    const img = p.images?.edges?.[0]?.node?.url || null;
+    const commonName = p.common?.value || null;
+    const plantCaliper = p.caliper?.value || null;
 
-    for (const v of (p.variants || [])) {
+    const variants = p.variants?.edges || [];
+    for (const ve of variants) {
+      const v = ve.node;
       rows.push({
         title: p.title,
-        commonName: meta.commonName || null,
-        plantCaliper: meta.plantCaliper || null,
+        commonName,
+        plantCaliper,
         sku: v.sku || null,
         price: v.price != null ? String(v.price) : null,
-        qty: typeof v.inventory_quantity === "number" ? v.inventory_quantity : null,
+        qty: typeof v.inventoryQuantity === "number" ? v.inventoryQuantity : null,
         url: p.handle ? `${PUBLIC_STORE_DOMAIN}/products/${p.handle}` : null,
         image: img
       });
@@ -171,6 +156,7 @@ function mapProductsToRows(products, metaMap) {
   return rows;
 }
 
+// ---------- handler ----------
 export default async function handler(req, res) {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
@@ -180,36 +166,10 @@ export default async function handler(req, res) {
       return res.status(500).json({ ok: false, error: "Missing env vars: SHOPIFY_STORE_DOMAIN and/or SHOPIFY_ADMIN_TOKEN" });
     }
 
-    // Debug: /api/inventory?debugMeta=1&limit=1
-    const debugMeta = String(req.query.debugMeta || "").toLowerCase() === "1";
-    const limit = Math.max(0, parseInt(String(req.query.limit || "0"), 10) || 0);
-
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
 
-    // 1) products
-    let products = await fetchAllProducts();
-    if (limit > 0) products = products.slice(0, limit);
-
-    // 2) metafields (bulk)
-    const allMetafields = await fetchAllProductMetafields();
-
-    if (debugMeta) {
-      // Show a summary so we can confirm namespace/keys coming back from Shopify
-      const sample = allMetafields.slice(0, 50).map(mf => ({
-        owner_id: mf.owner_id,
-        owner_resource: mf.owner_resource,
-        namespace: mf.namespace,
-        key: mf.key,
-        value_preview: typeof mf.value === "string" ? mf.value.slice(0, 40) : mf.value
-      }));
-      return res.status(200).json({ ok: true, note: "debugMeta sample", count: sample.length, sample });
-    }
-
-    // 3) map metafields -> product
-    const metaMap = buildMetaMap(allMetafields);
-
-    // 4) flatten rows (include all inventory; qty may be 0)
-    const items = mapProductsToRows(products, metaMap);
+    const products = await fetchAllProductPages();
+    const items = mapToRows(products);
 
     const generatedAt = new Date().toISOString();
     res.setHeader("X-RC-Generated-At", generatedAt);
