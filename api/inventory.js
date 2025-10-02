@@ -1,10 +1,14 @@
-// api/inventory.js — GraphQL (variant metafields) + minimal mode + edge cache + Blue filter
+// api/inventory.js — GraphQL (reads VARIANT metafields) + minimal mode + edge cache
+// - Pulls variant.metafields.custom.plant_height & .plant_caliper
+// - Blue filtering ONLY by product metafields (no tag fallback)
+// - CORS via ALLOWED_ORIGIN
+// - Supports ?minimal=1 & ?showOutOfStock=1
+
 const DEFAULT_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
 const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. rockcrest.myshopify.com
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
-// ---------- Helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function setCors(res) {
@@ -16,41 +20,36 @@ function setCors(res) {
 function unitAbbrev(u) {
   if (!u) return "";
   const s = String(u).toLowerCase();
-  if (s === "inches" || s === "inch" || s === "in") return "in";
-  if (s === "feet" || s === "foot" || s === "ft") return "ft";
-  if (s === "centimeters" || s === "cm") return "cm";
-  if (s === "meters" || s === "m") return "m";
+  if (["inches","inch","in"].includes(s)) return "in";
+  if (["feet","foot","ft"].includes(s)) return "ft";
+  if (["centimeters","centimeter","cm"].includes(s)) return "cm";
+  if (["meters","meter","m"].includes(s)) return "m";
   return s;
 }
 
-function normalizeMeasureFromJSONish(raw, defaultUnit = "in") {
-  if (raw == null) return null;
-  // GraphQL metafield.value can be:
-  //  - JSON string: {"value":4,"unit":"INCHES"}
-  //  - plain string: "4 INCHES" or "4"
-  // Try JSON first:
-  try {
-    const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (obj && obj.value != null) {
-      const num = Number(obj.value);
-      if (Number.isFinite(num)) {
-        const abbr = unitAbbrev(obj.unit) || defaultUnit;
-        return `${num} ${abbr}`;
+// Handles GraphQL metafield.value that might be JSON or plain text
+function normalizeMeasure(raw, defaultUnit = "in") {
+  if (raw == null || raw === "") return null;
+  // Try JSON {"value":4,"unit":"INCHES"}
+  if (typeof raw === "string") {
+    try {
+      const o = JSON.parse(raw);
+      if (o && o.value != null) {
+        const num = Number(o.value);
+        if (Number.isFinite(num)) return `${num} ${unitAbbrev(o.unit) || defaultUnit}`;
+        return String(o.value);
       }
-    }
-  } catch (_) { /* not JSON */ }
-
-  // If plain string, try to split numeric + unit
-  const s = String(raw).trim();
-  if (!s) return null;
-  // e.g. "4 INCHES" or "4 in"
-  const m = s.match(/^(\d+(\.\d+)?)(?:\s+([A-Za-z]+))?$/);
-  if (m) {
-    const num = m[1];
-    const abbr = unitAbbrev(m[3]) || defaultUnit;
-    return `${num} ${abbr}`;
+    } catch (_) { /* not JSON, continue */ }
+  } else if (typeof raw === "object" && raw.value != null) {
+    const num = Number(raw.value);
+    if (Number.isFinite(num)) return `${num} ${unitAbbrev(raw.unit) || defaultUnit}`;
+    return String(raw.value);
   }
-  // last resort, return as-is
+
+  // Try "4 INCHES" or "4 in"
+  const s = String(raw).trim();
+  const m = s.match(/^(\d+(?:\.\d+)?)(?:\s+([A-Za-z]+))?$/);
+  if (m) return `${m[1]} ${unitAbbrev(m[2]) || defaultUnit}`;
   return s;
 }
 
@@ -60,26 +59,22 @@ function normalizePrice(v) {
   return Number.isFinite(n) ? String(n) : String(v);
 }
 
-function isBlueByMetafields(productMF, productTags) {
-  if (productMF && typeof productMF === "object") {
-    const c = productMF.custom || {};
-    if (c.blue_tagged === true || String(c.blue_tagged).toLowerCase() === "true") return true;
-    if (typeof c.blue_tag === "string" && c.blue_tag.toLowerCase() === "blue") return true;
-    const list = c.tags || c.blue_tags || c.metatags;
-    if (Array.isArray(list) && list.some(x => String(x).toLowerCase() === "blue")) return true;
-    if (typeof list === "string") {
-      const parts = list.toLowerCase().split(/[,\|]/).map(s=>s.trim()).filter(Boolean);
-      if (parts.includes("blue")) return true;
-    }
-    return false; // metafields exist but none indicate blue
+// Only consider metafields to mark an item Blue (no tag fallback)
+function isBlueByMetafields(productMF) {
+  const c = productMF?.custom || {};
+  if (c.blue_tagged === true || String(c.blue_tagged).toLowerCase() === "true") return true;
+  if (typeof c.blue_tag === "string" && c.blue_tag.toLowerCase() === "blue") return true;
+
+  const list = c.tags || c.blue_tags || c.metatags;
+  if (Array.isArray(list) && list.some(x => String(x).toLowerCase() === "blue")) return true;
+  if (typeof list === "string") {
+    const parts = list.toLowerCase().split(/[,\|]/).map(s=>s.trim()).filter(Boolean);
+    if (parts.includes("blue")) return true;
   }
-  // fallback to product tags when no metafields exist
-  if (typeof productTags === "string" && productTags.toLowerCase().includes("blue")) return true;
   return false;
 }
 
-// ---------- GraphQL ----------
-const GQL_ENDPOINT = (version) => `https://${STORE_DOMAIN}/admin/api/${version}/graphql.json`;
+const GQL_ENDPOINT = (ver) => `https://${STORE_DOMAIN}/admin/api/${ver}/graphql.json`;
 
 async function gqlFetch(query, variables, attempt = 0) {
   const res = await fetch(GQL_ENDPOINT(DEFAULT_API_VERSION), {
@@ -93,7 +88,6 @@ async function gqlFetch(query, variables, attempt = 0) {
   });
 
   if (res.status === 429) {
-    // rate limited
     const retryAfter = Number(res.headers.get("Retry-After") || "2");
     await sleep(retryAfter * 1000);
     return gqlFetch(query, variables, attempt + 1);
@@ -111,9 +105,6 @@ async function gqlFetch(query, variables, attempt = 0) {
   return data.data;
 }
 
-// GraphQL query: products + variants + specific metafields
-// - Pull product metafields for "Blue" detection
-// - Pull variant metafields for height/caliper
 const PRODUCTS_QUERY = `
   query ProductsWithVariants($after: String) {
     products(first: 100, after: $after) {
@@ -123,19 +114,14 @@ const PRODUCTS_QUERY = `
           id
           title
           handle
-          tags
           productType
+          tags
           images(first: 1) { edges { node { url } } }
           metafields(identifiers: [
             {namespace: "custom", key: "blue_tagged"},
             {namespace: "custom", key: "blue_tag"},
             {namespace: "custom", key: "tags"}
-          ]) {
-            namespace
-            key
-            type
-            value
-          }
+          ]) { namespace key type value }
           variants(first: 100) {
             pageInfo { hasNextPage endCursor }
             edges {
@@ -148,12 +134,7 @@ const PRODUCTS_QUERY = `
                 metafields(identifiers: [
                   {namespace: "custom", key: "plant_height"},
                   {namespace: "custom", key: "plant_caliper"}
-                ]) {
-                  namespace
-                  key
-                  type
-                  value
-                }
+                ]) { namespace key type value }
               }
             }
           }
@@ -163,7 +144,6 @@ const PRODUCTS_QUERY = `
   }
 `;
 
-// Paginate variants if >100 per product
 const VARIANTS_QUERY = `
   query ProductVariants($productId: ID!, $after: String) {
     product(id: $productId) {
@@ -179,12 +159,7 @@ const VARIANTS_QUERY = `
             metafields(identifiers: [
               {namespace: "custom", key: "plant_height"},
               {namespace: "custom", key: "plant_caliper"}
-            ]) {
-              namespace
-              key
-              type
-              value
-            }
+            ]) { namespace key type value }
           }
         }
       }
@@ -192,124 +167,112 @@ const VARIANTS_QUERY = `
   }
 `;
 
-// ---------- Mapping ----------
-function metafieldsArrayToObject(arr) {
+function mfArrayToObj(arr) {
   const out = {};
   if (!Array.isArray(arr)) return out;
   for (const mf of arr) {
     if (!mf || !mf.namespace || !mf.key) continue;
     const ns = mf.namespace;
-    const k = mf.key;
     out[ns] = out[ns] || {};
-    // Try to coerce common boolean/text
+    // coerce booleans where type says boolean
     if (mf.type && mf.type.toLowerCase().includes("boolean")) {
-      out[ns][k] = String(mf.value).toLowerCase() === "true";
+      out[ns][mf.key] = String(mf.value).toLowerCase() === "true";
     } else {
-      out[ns][k] = mf.value;
+      out[ns][mf.key] = mf.value;
     }
   }
   return out;
 }
 
-function mapProductNodeToRows(node, storeDomain) {
-  const rows = [];
-
-  const productMF = metafieldsArrayToObject(node.metafields);
-  const isBlue = isBlueByMetafields(productMF, (node.tags || []).join(", "));
-  if (isBlue) return rows; // exclude entire product if blue at product level
-
-  const img = node.images?.edges?.[0]?.node?.url || null;
+function mapProductNode(node) {
+  const productMF = mfArrayToObj(node.metafields);
+  const blue = isBlueByMetafields(productMF);
   const base = {
     productId: node.id,
     title: node.title,
     handle: node.handle,
     productType: node.productType || null,
     tags: Array.isArray(node.tags) ? node.tags.join(", ") : (node.tags || null),
-    image: img,
-    url: node.handle ? `https://${storeDomain}/products/${node.handle}` : null,
-    metafields: productMF
+    image: node.images?.edges?.[0]?.node?.url || null,
+    url: node.handle ? `https://${STORE_DOMAIN}/products/${node.handle}` : null,
+    productMF
   };
 
-  const pushVariant = (vNode) => {
-    const vMF = metafieldsArrayToObject(vNode.metafields);
-    // If Blue is ever set at variant level, you could exclude here too (optional)
-    const cultivar = vNode.title && vNode.title !== "Default Title" ? vNode.title : null;
-
+  const rows = [];
+  const vEdges = node.variants?.edges || [];
+  for (const e of vEdges) {
+    const v = e.node;
+    const vMF = mfArrayToObj(v.metafields);
     rows.push({
       productId: base.productId,
-      variantId: vNode.id,
+      variantId: v.id,
       title: base.title,
       handle: base.handle,
-      cultivar,
-      sku: vNode.sku || cultivar || null,
-      price: normalizePrice(vNode.price),
-      qty: typeof vNode.inventoryQuantity === "number" ? vNode.inventoryQuantity : null,
+      cultivar: v.title && v.title !== "Default Title" ? v.title : null,
+      sku: v.sku || (v.title && v.title !== "Default Title" ? v.title : null),
+      price: normalizePrice(v.price),
+      qty: typeof v.inventoryQuantity === "number" ? v.inventoryQuantity : null,
       productType: base.productType,
       url: base.url,
       image: base.image,
       tags: base.tags,
       metafields: { product: productMF, variant: vMF },
-      plantHeight: normalizeMeasureFromJSONish(vMF?.custom?.plant_height, "in"),
-      plantCaliper: normalizeMeasureFromJSONish(vMF?.custom?.plant_caliper, "in")
+      plantHeight: normalizeMeasure(vMF?.custom?.plant_height, "in"),
+      plantCaliper: normalizeMeasure(vMF?.custom?.plant_caliper, "in"),
+      blue // marker if product-level blue (we’ll decide later whether to exclude)
     });
-  };
+  }
 
-  // Push up to first 100 variants
-  const vEdges = node.variants?.edges || [];
-  vEdges.forEach(e => pushVariant(e.node));
+  const needsVariantPagination = node.variants?.pageInfo?.hasNextPage || false;
+  const variantCursor = node.variants?.pageInfo?.endCursor || null;
 
-  // If product has more than 100 variants, we need to paginate variants as well
-  const hasMoreVariants = node.variants?.pageInfo?.hasNextPage;
-  const endCursor = node.variants?.pageInfo?.endCursor;
-
-  return { rows, needsVariantPagination: !!hasMoreVariants, productId: node.id, variantCursor: endCursor };
+  return { rows, blue, needsVariantPagination, variantCursor, productId: node.id, node };
 }
 
-// Fetch ALL products and variants (with pagination)
 async function fetchAllRows() {
-  const allRows = [];
+  const all = [];
   let after = null;
 
   do {
-    const data = await gqlFetch(PRODUCTS_QUERY, { after });
-    const conn = data.products;
+    const d = await gqlFetch(PRODUCTS_QUERY, { after });
+    const conn = d.products;
     for (const edge of conn.edges) {
-      const node = edge.node;
-      const mapped = mapProductNodeToRows(node, STORE_DOMAIN);
-      allRows.push(...mapped.rows);
+      const { rows, blue, needsVariantPagination, variantCursor, productId, node } = mapProductNode(edge.node);
+      // If product-level metafield marks Blue, exclude all its rows
+      if (!blue) all.push(...rows);
 
-      if (mapped.needsVariantPagination) {
-        // paginate variants for this product
-        let vAfter = mapped.variantCursor;
-        let keepGoing = true;
-        while (keepGoing) {
-          const vData = await gqlFetch(VARIANTS_QUERY, { productId: node.id, after: vAfter });
-          const vConn = vData.product?.variants;
+      if (needsVariantPagination) {
+        let vAfter = variantCursor;
+        let keep = true;
+        while (keep) {
+          const vd = await gqlFetch(VARIANTS_QUERY, { productId, after: vAfter });
+          const vConn = vd.product?.variants;
           if (!vConn) break;
           for (const vEdge of vConn.edges) {
-            const vNode = vEdge.node;
-            // We need the product-level context to compute row; recreate light base here:
-            const vMF = metafieldsArrayToObject(vNode.metafields);
-            const cultivar = vNode.title && vNode.title !== "Default Title" ? vNode.title : null;
-            allRows.push({
-              productId: node.id,
-              variantId: vNode.id,
-              title: node.title,
-              handle: node.handle,
-              cultivar,
-              sku: vNode.sku || cultivar || null,
-              price: normalizePrice(vNode.price),
-              qty: typeof vNode.inventoryQuantity === "number" ? vNode.inventoryQuantity : null,
-              productType: node.productType || null,
-              url: node.handle ? `https://${STORE_DOMAIN}/products/${node.handle}` : null,
-              image: node.images?.edges?.[0]?.node?.url || null,
-              tags: Array.isArray(node.tags) ? node.tags.join(", ") : (node.tags || null),
-              metafields: { product: metafieldsArrayToObject(node.metafields), variant: vMF },
-              plantHeight: normalizeMeasureFromJSONish(vMF?.custom?.plant_height, "in"),
-              plantCaliper: normalizeMeasureFromJSONish(vMF?.custom?.plant_caliper, "in")
-            });
+            const v = vEdge.node;
+            const vMF = mfArrayToObj(v.metafields);
+            if (!blue) {
+              all.push({
+                productId: node.id,
+                variantId: v.id,
+                title: node.title,
+                handle: node.handle,
+                cultivar: v.title && v.title !== "Default Title" ? v.title : null,
+                sku: v.sku || (v.title && v.title !== "Default Title" ? v.title : null),
+                price: normalizePrice(v.price),
+                qty: typeof v.inventoryQuantity === "number" ? v.inventoryQuantity : null,
+                productType: node.productType || null,
+                url: node.handle ? `https://${STORE_DOMAIN}/products/${node.handle}` : null,
+                image: node.images?.edges?.[0]?.node?.url || null,
+                tags: Array.isArray(node.tags) ? node.tags.join(", ") : (node.tags || null),
+                metafields: { product: mfArrayToObj(node.metafields), variant: vMF },
+                plantHeight: normalizeMeasure(vMF?.custom?.plant_height, "in"),
+                plantCaliper: normalizeMeasure(vMF?.custom?.plant_caliper, "in"),
+                blue
+              });
+            }
           }
-          keepGoing = vConn.pageInfo?.hasNextPage;
+          keep = vConn.pageInfo?.hasNextPage;
           vAfter = vConn.pageInfo?.endCursor || null;
         }
       }
@@ -317,10 +280,9 @@ async function fetchAllRows() {
     after = conn.pageInfo?.hasNextPage ? conn.pageInfo.endCursor : null;
   } while (after);
 
-  return allRows;
+  return all;
 }
 
-// ---------- Handler ----------
 export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -334,20 +296,18 @@ export default async function handler(req, res) {
     const showOut = ["1","true","yes"].includes(String(req.query.showOutOfStock||"").toLowerCase());
     const productType = req.query.productType ? String(req.query.productType).toLowerCase() : null;
 
-    // Strong edge caching for speed
     res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=900");
 
-    const rows = await fetchAllRows();
+    let items = await fetchAllRows();
 
-    // Optional productType filter
-    let items = productType
-      ? rows.filter(r => (r.productType||"").toLowerCase() === productType)
-      : rows;
+    if (productType) {
+      items = items.filter(r => (r.productType || "").toLowerCase() === productType);
+    }
 
-    // Hide OOS unless requested
-    if (!showOut) items = items.filter(i => typeof i.qty === "number" && i.qty > 0);
+    if (!showOut) {
+      items = items.filter(i => typeof i.qty === "number" && i.qty > 0);
+    }
 
-    // Final shape
     if (minimal) {
       items = items.map(i => ({
         title: i.title,
