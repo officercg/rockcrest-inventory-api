@@ -1,15 +1,17 @@
-// Serverless function for Vercel (Node 20)
-// Fetches product + variant inventory from Shopify Admin REST API
-// Normalizes metafields (height, caliper) into human-readable strings.
-
+// api/inventory.js — fast minimal mode + edge cache + Blue filter
 const DEFAULT_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
-const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // e.g. "rockcrest.myshopify.com"
+const STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Parse Link header for REST cursor pagination
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 function parseLinkHeader(linkHeader) {
   if (!linkHeader) return {};
   const parts = linkHeader.split(",");
@@ -24,11 +26,12 @@ function parseLinkHeader(linkHeader) {
   return links;
 }
 
-// Fetch all products (REST)
-async function fetchAllProducts({ fields = "id,title,handle,variants,product_type,tags,images,metafields", limit = 250 }) {
-  let url = `https://${STORE_DOMAIN}/admin/api/${DEFAULT_API_VERSION}/products.json?limit=${limit}&fields=${encodeURIComponent(fields)}&expand=metafields`;
-  const items = [];
+// REST: fetch products in pages (with the minimal fields we need)
+async function fetchAllProducts({ limit = 250 }) {
+  const fields = "id,title,handle,product_type,tags,images,variants,metafields";
+  let url = `https://${STORE_DOMAIN}/admin/api/${DEFAULT_API_VERSION}/products.json?limit=${limit}&fields=${encodeURIComponent(fields)}`;
 
+  const items = [];
   while (url) {
     const res = await fetch(url, {
       headers: {
@@ -42,7 +45,6 @@ async function fetchAllProducts({ fields = "id,title,handle,variants,product_typ
       await sleep(retryAfter * 1000);
       continue;
     }
-
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`Shopify error ${res.status}: ${text || res.statusText}`);
@@ -50,114 +52,128 @@ async function fetchAllProducts({ fields = "id,title,handle,variants,product_typ
 
     const data = await res.json();
     items.push(...(data.products || []));
+
     const links = parseLinkHeader(res.headers.get("link"));
     url = links.next || null;
   }
-
   return items;
 }
 
-// Normalize metafield object into string (e.g. "4 INCHES")
-function normalizeMetaField(mf) {
-  if (!mf) return null;
-  if (typeof mf === "string") return mf;
-  if (typeof mf === "object") {
-    const v = mf.value ?? mf.amount ?? "";
-    const u = mf.unit ?? "";
-    return `${v} ${u}`.trim();
+// Try multiple metafield shapes (see instructions given to team)
+function isBlueByMetafields(mf, tagsStr) {
+  if (mf && typeof mf === "object") {
+    const c = mf.custom || {};
+    // 1) boolean
+    if (c.blue_tagged === true || String(c.blue_tagged).toLowerCase() === "true") return true;
+    // 2) text equals 'blue'
+    if (typeof c.blue_tag === "string" && c.blue_tag.toLowerCase() === "blue") return true;
+    // 3) list contains 'blue'
+    const list = c.tags || c.blue_tags || c.metatags;
+    if (Array.isArray(list) && list.some(x => String(x).toLowerCase() === "blue")) return true;
+    if (typeof list === "string") {
+      const parts = list.toLowerCase().split(/[,\|]/).map(s=>s.trim()).filter(Boolean);
+      if (parts.includes("blue")) return true;
+    }
+    return false; // if metafields exist but no blue, do not fallback to product tags
   }
-  return null;
+  // fallback only when no metafields present
+  if (typeof tagsStr === "string" && tagsStr.toLowerCase().includes("blue")) return true;
+  return false;
 }
 
-// Map products/variants
-function mapProductsToInventory(products) {
+// Map products/variants to compact rows.
+// In minimal mode we only include the columns the page actually renders.
+function mapProductsToRows(products, { minimal = false, excludeBlue = true }) {
   const rows = [];
   for (const p of products) {
-    const img = (p.images && p.images[0] && p.images[0].src) ? p.images[0].src : null;
+    const img = p.images?.[0]?.src || null;
+    const mf = p.metafields || null;
+
+    const blue = excludeBlue ? isBlueByMetafields(mf, p.tags || "") : false;
+    if (blue) continue;
 
     for (const v of (p.variants || [])) {
-      // Grab metafields (height, caliper, etc.)
-      const meta = v.metafields?.custom || {};
-
-      rows.push({
+      const base = {
         productId: String(p.id),
         variantId: String(v.id),
         title: p.title,
         handle: p.handle,
-        cultivar: v.title === "Default Title" ? null : v.title,
-        sku: v.sku || v.title || null,
+        cultivar: v.title && v.title !== "Default Title" ? v.title : null, // variant name
+        sku: v.sku || null,
         price: v.price != null ? String(v.price) : null,
-        quantity: typeof v.inventory_quantity === "number" ? v.inventory_quantity : null,
-        image: img,
+        qty: typeof v.inventory_quantity === "number" ? v.inventory_quantity : null,
         productType: p.product_type || null,
+        url: p.handle ? `https://${STORE_DOMAIN}/products/${p.handle}` : null,
+        // try to include caliper if Shopify includes metafields inline; otherwise null
+        plantCaliper: (mf?.custom?.plant_caliper && typeof mf.custom.plant_caliper === "object")
+          ? (mf.custom.plant_caliper.value ?? null)
+          : (mf?.custom?.plant_caliper ?? null),
+        // keep for non-minimal consumers
+        image: img,
         tags: p.tags || null,
-        plantHeight: normalizeMetaField(meta.plant_height),
-        plantCaliper: normalizeMetaField(meta.plant_caliper),
-        pottingType: normalizeMetaField(meta.potting_type),
-        containerSize: normalizeMetaField(meta.container_size),
-        url: p.handle ? `https://${STORE_DOMAIN}/products/${p.handle}` : null
-      });
+        metafields: mf || null
+      };
+
+      if (minimal) {
+        rows.push({
+          title: base.title,
+          cultivar: base.cultivar,
+          plantCaliper: normalizeCaliper(base.plantCaliper),
+          sku: base.sku,
+          price: base.price,
+          qty: base.qty,
+          url: base.url
+        });
+      } else {
+        base.plantCaliper = normalizeCaliper(base.plantCaliper);
+        rows.push(base);
+      }
     }
   }
   return rows;
 }
 
-// Filters
-function filterInStock(items) {
-  return items.filter(i => typeof i.quantity === "number" && i.quantity > 0);
+function normalizeCaliper(val) {
+  // Accepts "4 in", 4, { value: 4, unit: "INCHES" } → returns "4 in"
+  if (val == null) return null;
+  if (typeof val === "object" && val.value != null) {
+    const u = (val.unit || "").toString().toLowerCase();
+    const num = Number(val.value);
+    if (Number.isFinite(num)) return `${num} ${u === "inches" || u === "inch" ? "in" : u}`;
+  }
+  if (typeof val === "number") return `${val} in`;
+  return String(val);
 }
 
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-// Handler
 export default async function handler(req, res) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
     if (!STORE_DOMAIN || !ADMIN_TOKEN) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing env vars: SHOPIFY_STORE_DOMAIN and/or SHOPIFY_ADMIN_TOKEN"
-      });
+      return res.status(500).json({ ok:false, error:"Missing env vars: SHOPIFY_STORE_DOMAIN and/or SHOPIFY_ADMIN_TOKEN" });
     }
 
-    // Query params
-    const showOutOfStock = (req.query.showOutOfStock || "").toLowerCase() === "true";
-    const productType = req.query.productType || null;
-    const hasTag = req.query.tag || null;
+    // query flags
+    const minimal = ["1","true","yes"].includes(String(req.query.minimal||"").toLowerCase());
+    // (excludeBlue stays true; you can add a flag to disable if ever needed)
 
-    res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
+    // Strong edge caching: fast for most visitors
+    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=900");
 
-    const products = await fetchAllProducts({});
-    let items = mapProductsToInventory(products);
+    const products = await fetchAllProducts({ limit: 250 });
+    let items = mapProductsToRows(products, { minimal, excludeBlue: true });
 
-    if (productType) items = items.filter(i => (i.productType || "").toLowerCase() === productType.toLowerCase());
-    if (hasTag) items = items.filter(i => (i.tags || "").toLowerCase().split(", ").includes(hasTag.toLowerCase()));
+    // Client-side extra filters if present
+    const productType = req.query.productType ? String(req.query.productType).toLowerCase() : null;
+    if (productType) items = items.filter(i => (i.productType||"").toLowerCase() === productType);
 
-    if (!showOutOfStock) items = filterInStock(items);
+    const showOutOfStock = ["1","true","yes"].includes(String(req.query.showOutOfStock||"").toLowerCase());
+    if (!showOutOfStock) items = items.filter(i => typeof i.qty === "number" && i.qty > 0);
 
-    const minimal = (req.query.minimal || "").toLowerCase() === "true";
-    if (minimal) {
-      items = items.map(i => ({
-        title: i.title,
-        cultivar: i.cultivar,
-        sku: i.sku,
-        qty: i.quantity,
-        price: i.price,
-        plantHeight: i.plantHeight,
-        plantCaliper: i.plantCaliper,
-        url: i.url
-      }));
-    }
-
-    res.status(200).json({ ok: true, count: items.length, generatedAt: new Date().toISOString(), items });
+    res.status(200).json({ ok:true, generatedAt: new Date().toISOString(), count: items.length, items });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, error: err.message || "Internal error" });
+    res.status(500).json({ ok:false, error: err.message || "Internal error" });
   }
 }
